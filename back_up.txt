@@ -1,0 +1,645 @@
+import numpy as np
+import tensorflow as tf
+import cv2
+from flask import Flask, request, jsonify
+from PIL import Image
+import mediapipe as mp
+
+app = Flask(__name__)
+
+# Load MoveNet
+interpreter = tf.lite.Interpreter(model_path="movenet_singlepose_lightning.tflite")
+interpreter.allocate_tensors()
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+# Initialize MediaPipe Pose
+mp_pose = mp.solutions.pose
+pose_tracker = mp_pose.Pose(static_image_mode=True)
+
+def preprocess_image(image):
+    image_resized = cv2.resize(image, (192, 192))
+    input_type = input_details[0]['dtype']
+    image_input = image_resized.astype(np.float32) / 255.0 if input_type != np.uint8 else image_resized.astype(np.uint8)
+    return np.expand_dims(image_input, axis=0)
+
+def run_inference(image_np):
+    input_data = preprocess_image(image_np)
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+    interpreter.invoke()
+    return interpreter.get_tensor(output_details[0]['index'])[0][0]
+
+def calculate_distance(p1, p2, image_width, image_height):
+    x1, y1 = int(p1[1] * image_width), int(p1[0] * image_height)
+    x2, y2 = int(p2[1] * image_width), int(p2[0] * image_height)
+    return np.linalg.norm([x2 - x1, y2 - y1])
+
+def get_circumferences(image_np, image_width, image_height, pixels_per_cm):
+    image_rgb = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+    results = pose_tracker.process(image_rgb)
+    if not results.pose_landmarks:
+        return {"error": "No landmarks detected"}
+    lm = results.pose_landmarks.landmark
+
+    def px_distance(p1, p2):
+        return np.linalg.norm([
+            (p1.x - p2.x) * image_width,
+            (p1.y - p2.y) * image_height
+        ])
+
+    def ellipse_circumference(width_px, depth_px):
+        a = width_px / 2
+        b = abs(depth_px) / 2 if depth_px != 0 else a * 0.7
+        return np.pi * (3*(a+b) - np.sqrt((3*a + b)*(a + 3*b)))
+
+    # Hip Circumference calculation with realistic scaling
+    left_hip, right_hip = lm[mp_pose.PoseLandmark.LEFT_HIP], lm[mp_pose.PoseLandmark.RIGHT_HIP]
+    hip_width_px = px_distance(left_hip, right_hip)
+
+    # The depth of the hip is not arbitrary; it's based on the body's proportions.
+    hip_depth_px = hip_width_px * 0.4  # Realistic depth ratio for hips
+    hip_circum_px = ellipse_circumference(hip_width_px, hip_depth_px)
+
+    # Wrist Circumference — assume ~5.5 cm actual diameter
+    wrist_width_px = 5.5 * pixels_per_cm
+    wrist_depth_px = wrist_width_px * 0.7
+    wrist_circum_px = ellipse_circumference(wrist_width_px, wrist_depth_px)
+
+    # Upper Arm Circumference — estimate around bicep area
+    left_shoulder = lm[mp_pose.PoseLandmark.LEFT_SHOULDER]
+    left_elbow = lm[mp_pose.PoseLandmark.LEFT_ELBOW]
+    upper_arm_len_px = px_distance(left_shoulder, left_elbow)
+    arm_width_px = upper_arm_len_px * 0.2  # approximate thickness
+    arm_depth_px = arm_width_px * 0.8
+    arm_circum_px = ellipse_circumference(arm_width_px, arm_depth_px)
+
+    return {
+        "hip_circumference": {
+            "pixels": round(hip_circum_px, 2),
+            "cm": round(hip_circum_px / pixels_per_cm, 2)
+        },
+        "wrist_circumference": {
+            "pixels": round(wrist_circum_px, 2),
+            "cm": round(wrist_circum_px / pixels_per_cm, 2)
+        },
+        "upper_arm_circumference": {
+            "pixels": round(arm_circum_px, 2),
+            "cm": round(arm_circum_px / pixels_per_cm, 2)
+        }
+    }
+
+@app.route('/upload', methods=['POST'])
+def upload_image():
+    if 'image' not in request.files:
+        return jsonify({"error": "No image file provided"}), 400
+
+    height_cm = float(request.form.get('height_cm', 170))
+    file = request.files['image']
+    image = Image.open(file.stream).convert('RGB')
+    image_np = np.array(image)
+    image_height, image_width, _ = image_np.shape
+
+    keypoints = run_inference(image_np)
+    def kp(index): return keypoints[index][:2]
+
+    left_shoulder = kp(5)
+    left_elbow = kp(7)
+    left_wrist = kp(9)
+    left_ankle = kp(15)
+    right_shoulder = kp(6)
+    right_hip = kp(12)
+    left_hip = kp(11)
+
+    pixel_height = calculate_distance(left_shoulder, left_ankle, image_width, image_height)
+    pixels_per_cm = pixel_height / height_cm
+
+    shoulder_width_px = calculate_distance(left_shoulder, right_shoulder, image_width, image_height)
+    hip_width_px = calculate_distance(left_hip, right_hip, image_width, image_height)
+    left_arm_length_px = (
+        calculate_distance(left_shoulder, left_elbow, image_width, image_height) +
+        calculate_distance(left_elbow, left_wrist, image_width, image_height)
+    )
+
+    circum_data = get_circumferences(image_np, image_width, image_height, pixels_per_cm)
+
+    result = {
+        "shoulder_width": {
+            "pixels": round(shoulder_width_px, 2),
+            "cm": round(shoulder_width_px / pixels_per_cm, 2)
+        },
+        "hip_width": {
+            "pixels": round(hip_width_px, 2),
+            "cm": round(hip_width_px / pixels_per_cm, 2)
+        },
+        "left_arm_length": {
+            "pixels": round(left_arm_length_px, 2),
+            "cm": round(left_arm_length_px / pixels_per_cm, 2)
+        },
+        "scale": {
+            "pixels_per_cm": round(pixels_per_cm, 4)
+        },
+        **circum_data
+    }
+
+    return jsonify(result)
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", debug=True)
+================================================================================================
+
+import numpy as np
+import tensorflow as tf
+import cv2
+from flask import Flask, request, jsonify
+from PIL import Image
+import mediapipe as mp
+
+app = Flask(__name__)
+
+# Load MoveNet
+interpreter = tf.lite.Interpreter(model_path="movenet_singlepose_lightning.tflite")
+interpreter.allocate_tensors()
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+# Initialize MediaPipe Pose
+mp_pose = mp.solutions.pose
+pose_tracker = mp_pose.Pose(static_image_mode=True)
+
+def preprocess_image(image):
+    image_resized = cv2.resize(image, (192, 192))
+    input_type = input_details[0]['dtype']
+    image_input = image_resized.astype(np.float32) / 255.0 if input_type != np.uint8 else image_resized.astype(np.uint8)
+    return np.expand_dims(image_input, axis=0)
+
+def run_inference(image_np):
+    input_data = preprocess_image(image_np)
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+    interpreter.invoke()
+    return interpreter.get_tensor(output_details[0]['index'])[0][0]
+
+def calculate_distance(p1, p2, image_width, image_height):
+    x1, y1 = int(p1[1] * image_width), int(p1[0] * image_height)
+    x2, y2 = int(p2[1] * image_width), int(p2[0] * image_height)
+    return np.linalg.norm([x2 - x1, y2 - y1])
+
+def get_circumferences(image_np, image_width, image_height, pixels_per_cm):
+    image_rgb = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+    results = pose_tracker.process(image_rgb)
+    if not results.pose_landmarks:
+        return {"error": "No landmarks detected"}
+    lm = results.pose_landmarks.landmark
+
+    def px_distance(p1, p2):
+        return np.linalg.norm([
+            (p1.x - p2.x) * image_width,
+            (p1.y - p2.y) * image_height
+        ])
+
+    def ellipse_circumference(width_px, depth_px):
+        a = width_px / 2
+        b = abs(depth_px) / 2 if depth_px != 0 else a * 0.7
+        return np.pi * (3*(a+b) - np.sqrt((3*a + b)*(a + 3*b)))
+
+    # Hip Circumference
+    left_hip, right_hip = lm[mp_pose.PoseLandmark.LEFT_HIP], lm[mp_pose.PoseLandmark.RIGHT_HIP]
+    hip_width_px = px_distance(left_hip, right_hip)
+    hip_depth_px = hip_width_px * 0.75  # Adjusted realistic depth
+    hip_circum_px = ellipse_circumference(hip_width_px, hip_depth_px)
+
+    # Wrist Circumference – assume 5.5 cm diameter
+    wrist_width_px = 5.5 * pixels_per_cm
+    wrist_depth_px = wrist_width_px * 0.7
+    wrist_circum_px = ellipse_circumference(wrist_width_px, wrist_depth_px)
+
+    # Upper Arm Circumference
+    left_shoulder = lm[mp_pose.PoseLandmark.LEFT_SHOULDER]
+    left_elbow = lm[mp_pose.PoseLandmark.LEFT_ELBOW]
+    upper_arm_len_px = px_distance(left_shoulder, left_elbow)
+    arm_width_px = upper_arm_len_px * 0.25  # Improved proportion
+    arm_depth_px = arm_width_px * 0.8
+    arm_circum_px = ellipse_circumference(arm_width_px, arm_depth_px)
+
+    return {
+        "hip_circumference": {
+            "pixels": round(hip_circum_px, 2),
+            "cm": round(hip_circum_px / pixels_per_cm, 2)
+        },
+        "wrist_circumference": {
+            "pixels": round(wrist_circum_px, 2),
+            "cm": round(wrist_circum_px / pixels_per_cm, 2)
+        },
+        "upper_arm_circumference": {
+            "pixels": round(arm_circum_px, 2),
+            "cm": round(arm_circum_px / pixels_per_cm, 2)
+        }
+    }
+
+@app.route('/upload', methods=['POST'])
+def upload_image():
+    if 'image' not in request.files:
+        return jsonify({"error": "No image file provided"}), 400
+
+    height_cm = float(request.form.get('height_cm', 170))
+    file = request.files['image']
+    image = Image.open(file.stream).convert('RGB')
+    image_np = np.array(image)
+    image_height, image_width, _ = image_np.shape
+
+    keypoints = run_inference(image_np)
+    def kp(index): return keypoints[index][:2]
+
+    nose = kp(0)
+    left_ankle = kp(15)
+    right_ankle = kp(16)
+
+    # Average ankle for better stability
+    avg_ankle = [
+        (left_ankle[0] + right_ankle[0]) / 2,
+        (left_ankle[1] + right_ankle[1]) / 2
+    ]
+
+    pixel_height = calculate_distance(nose, avg_ankle, image_width, image_height)
+    pixels_per_cm = pixel_height / height_cm
+
+    left_shoulder = kp(5)
+    right_shoulder = kp(6)
+    left_elbow = kp(7)
+    left_wrist = kp(9)
+    left_hip = kp(11)
+    right_hip = kp(12)
+
+    shoulder_width_px = calculate_distance(left_shoulder, right_shoulder, image_width, image_height)
+    hip_width_px = calculate_distance(left_hip, right_hip, image_width, image_height)
+
+    left_arm_length_px = (
+        calculate_distance(left_shoulder, left_elbow, image_width, image_height) +
+        calculate_distance(left_elbow, left_wrist, image_width, image_height)
+    )
+
+    circum_data = get_circumferences(image_np, image_width, image_height, pixels_per_cm)
+
+    result = {
+        "shoulder_width": {
+            "pixels": round(shoulder_width_px, 2),
+            "cm": round(shoulder_width_px / pixels_per_cm, 2)
+        },
+        "hip_width": {
+            "pixels": round(hip_width_px, 2),
+            "cm": round(hip_width_px / pixels_per_cm, 2)
+        },
+        "left_arm_length": {
+            "pixels": round(left_arm_length_px, 2),
+            "cm": round(left_arm_length_px / pixels_per_cm, 2)
+        },
+        "scale": {
+            "pixels_per_cm": round(pixels_per_cm, 4),
+            "estimated_pixel_height": round(pixel_height, 2),
+            "assumed_real_height_cm": height_cm
+        },
+        **circum_data
+    }
+
+    return jsonify(result)
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", debug=True)
+==============================================================================================================
+
+final code:
+
+
+import numpy as np
+import tensorflow as tf
+import cv2
+from flask import Flask, request, jsonify
+from PIL import Image
+import mediapipe as mp
+
+app = Flask(__name__)
+
+# Load MoveNet
+interpreter = tf.lite.Interpreter(model_path="movenet_singlepose_lightning.tflite")
+interpreter.allocate_tensors()
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+# Initialize MediaPipe Pose
+mp_pose = mp.solutions.pose
+pose_tracker = mp_pose.Pose(static_image_mode=True)
+
+def preprocess_image(image):
+    image_resized = cv2.resize(image, (192, 192))
+    input_type = input_details[0]['dtype']
+    image_input = image_resized.astype(np.float32) / 255.0 if input_type != np.uint8 else image_resized.astype(np.uint8)
+    return np.expand_dims(image_input, axis=0)
+
+def run_inference(image_np):
+    input_data = preprocess_image(image_np)
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+    interpreter.invoke()
+    return interpreter.get_tensor(output_details[0]['index'])[0][0]
+
+def calculate_distance(p1, p2, image_width, image_height):
+    x1, y1 = int(p1[1] * image_width), int(p1[0] * image_height)
+    x2, y2 = int(p2[1] * image_width), int(p2[0] * image_height)
+    return np.linalg.norm([x2 - x1, y2 - y1])
+
+def get_circumferences(image_np, image_width, image_height, pixels_per_cm):
+    image_rgb = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+    results = pose_tracker.process(image_rgb)
+    if not results.pose_landmarks:
+        return {"error": "No landmarks detected"}
+    lm = results.pose_landmarks.landmark
+
+    def px_distance(p1, p2):
+        return np.linalg.norm([
+            (p1.x - p2.x) * image_width,
+            (p1.y - p2.y) * image_height
+        ])
+
+    def ellipse_circumference(width_px, depth_px):
+        a = width_px / 2
+        b = abs(depth_px) / 2 if depth_px != 0 else a * 0.7
+        return np.pi * (3*(a+b) - np.sqrt((3*a + b)*(a + 3*b)))
+
+    left_hip, right_hip = lm[mp_pose.PoseLandmark.LEFT_HIP], lm[mp_pose.PoseLandmark.RIGHT_HIP]
+    hip_width_px = px_distance(left_hip, right_hip)
+    hip_depth_px = hip_width_px * 0.75  
+    hip_circum_px = ellipse_circumference(hip_width_px, hip_depth_px)
+
+   
+    wrist_width_px = 5.5 * pixels_per_cm
+    wrist_depth_px = wrist_width_px * 0.7
+    wrist_circum_px = ellipse_circumference(wrist_width_px, wrist_depth_px)
+
+    
+    left_shoulder = lm[mp_pose.PoseLandmark.LEFT_SHOULDER]
+    left_elbow = lm[mp_pose.PoseLandmark.LEFT_ELBOW]
+    upper_arm_len_px = px_distance(left_shoulder, left_elbow)
+    arm_width_px = upper_arm_len_px * 0.25 
+    arm_depth_px = arm_width_px * 0.8
+    arm_circum_px = ellipse_circumference(arm_width_px, arm_depth_px)
+
+    return {
+        "hip_circumference": {
+            "pixels": round(hip_circum_px, 2),
+            "cm": round(hip_circum_px / pixels_per_cm, 2)
+        },
+        "wrist_circumference": {
+            "pixels": round(wrist_circum_px, 2),
+            "cm": round(wrist_circum_px / pixels_per_cm, 2)
+        },
+        "upper_arm_circumference": {
+            "pixels": round(arm_circum_px, 2),
+            "cm": round(arm_circum_px / pixels_per_cm, 2)
+        }
+    }
+
+@app.route('/upload', methods=['POST'])
+def upload_image():
+    if 'image' not in request.files:
+        return jsonify({"error": "No image file provided"}), 400
+
+    height_cm = float(request.form.get('height_cm', 170))
+    file = request.files['image']
+    image = Image.open(file.stream).convert('RGB')
+    image_np = np.array(image)
+    image_height, image_width, _ = image_np.shape
+
+    keypoints = run_inference(image_np)
+    def kp(index): return keypoints[index][:2]
+
+    nose = kp(0)
+    left_ankle = kp(15)
+    right_ankle = kp(16)
+
+    
+    avg_ankle = [
+        (left_ankle[0] + right_ankle[0]) / 2,
+        (left_ankle[1] + right_ankle[1]) / 2
+    ]
+
+    pixel_height = calculate_distance(nose, avg_ankle, image_width, image_height)
+    pixels_per_cm = pixel_height / height_cm
+
+    left_shoulder = kp(5)
+    right_shoulder = kp(6)
+    left_elbow = kp(7)
+    left_wrist = kp(9)
+    left_hip = kp(11)
+    right_hip = kp(12)
+
+    shoulder_width_px = calculate_distance(left_shoulder, right_shoulder, image_width, image_height)
+    hip_width_px = calculate_distance(left_hip, right_hip, image_width, image_height)
+
+    left_arm_length_px = (
+        calculate_distance(left_shoulder, left_elbow, image_width, image_height) +
+        calculate_distance(left_elbow, left_wrist, image_width, image_height)
+    )
+
+    circum_data = get_circumferences(image_np, image_width, image_height, pixels_per_cm)
+
+    result = {
+        "shoulder_width": {
+            "pixels": round(shoulder_width_px, 2),
+            "cm": round(shoulder_width_px / pixels_per_cm, 2)
+        },
+        "hip_width": {
+            "pixels": round(hip_width_px, 2),
+            "cm": round(hip_width_px / pixels_per_cm, 2)
+        },
+        "left_arm_length": {
+            "pixels": round(left_arm_length_px, 2),
+            "cm": round(left_arm_length_px / pixels_per_cm, 2)
+        },
+        "scale": {
+            "pixels_per_cm": round(pixels_per_cm, 4),
+            "estimated_pixel_height": round(pixel_height, 2),
+            "assumed_real_height_cm": height_cm
+        },
+        **circum_data
+    }
+
+    return jsonify(result)
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", debug=True)
+===========================================================================================
+
+import numpy as np
+import tensorflow as tf
+import cv2
+from flask import Flask, request, jsonify
+from PIL import Image
+import mediapipe as mp
+
+app = Flask(__name__)
+
+# Load MoveNet model
+interpreter = tf.lite.Interpreter(model_path="movenet_singlepose_lightning.tflite")
+interpreter.allocate_tensors()
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+# MediaPipe Pose
+mp_pose = mp.solutions.pose
+pose_tracker = mp_pose.Pose(static_image_mode=True)
+
+def preprocess_image(image):
+    image_resized = cv2.resize(image, (192, 192))
+    input_type = input_details[0]['dtype']
+    image_input = image_resized.astype(np.float32) / 255.0 if input_type != np.uint8 else image_resized.astype(np.uint8)
+    return np.expand_dims(image_input, axis=0)
+
+def run_inference(image_np):
+    input_data = preprocess_image(image_np)
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+    interpreter.invoke()
+    return interpreter.get_tensor(output_details[0]['index'])[0][0]
+
+def calculate_distance(p1, p2, image_width, image_height):
+    x1, y1 = int(p1[1] * image_width), int(p1[0] * image_height)
+    x2, y2 = int(p2[1] * image_width), int(p2[0] * image_height)
+    return np.linalg.norm([x2 - x1, y2 - y1])
+
+def calculate_measurements(keypoints, image_np, image_width, image_height, pixels_per_cm):
+    def kp(i): return keypoints[i][:2]
+
+    # Key landmarks
+    nose = kp(0)
+    l_shoulder, r_shoulder = kp(5), kp(6)
+    l_elbow, l_wrist = kp(7), kp(9)
+    l_hip, r_hip = kp(11), kp(12)
+    l_ankle, r_ankle = kp(15), kp(16)
+
+    mid_shoulder = [(l_shoulder[0] + r_shoulder[0]) / 2, (l_shoulder[1] + r_shoulder[1]) / 2]
+    mid_hip = [(l_hip[0] + r_hip[0]) / 2, (l_hip[1] + r_hip[1]) / 2]
+    avg_ankle = [(l_ankle[0] + r_ankle[0]) / 2, (l_ankle[1] + r_ankle[1]) / 2]
+
+    # Distances in pixels
+    shoulder_px = calculate_distance(l_shoulder, r_shoulder, image_width, image_height)
+    chest_px = shoulder_px * 1.1
+    waist_px = shoulder_px * 0.9
+    arm_length_px = (
+        calculate_distance(l_shoulder, l_elbow, image_width, image_height) +
+        calculate_distance(l_elbow, l_wrist, image_width, image_height)
+    )
+    neck_px = shoulder_px * 0.45
+    armhole_px = shoulder_px * 0.75
+    shirt_length_px = calculate_distance(mid_shoulder, avg_ankle, image_width, image_height)
+
+    def px_to_inch(px): return round(px / pixels_per_cm / 2.54, 2)
+
+    return {
+        "shoulder": px_to_inch(shoulder_px),
+        "chest": px_to_inch(chest_px),
+        "waist": px_to_inch(waist_px),
+        "sleeve": px_to_inch(arm_length_px),
+        "armhole": px_to_inch(armhole_px),
+        "neck": px_to_inch(neck_px),
+        "shirt_length": px_to_inch(shirt_length_px)
+    }
+
+@app.route('/upload', methods=['POST'])
+def upload():
+    if 'image' not in request.files:
+        return jsonify({"error": "No image uploaded"}), 400
+
+    height_cm = float(request.form.get("height_cm", 170))
+    file = request.files['image']
+    image = Image.open(file.stream).convert('RGB')
+    image_np = np.array(image)
+    image_height, image_width, _ = image_np.shape
+
+    # Keypoints from MoveNet
+    keypoints = run_inference(image_np)
+    def kp(i): return keypoints[i][:2]
+
+    nose = kp(0)
+    l_ankle, r_ankle = kp(15), kp(16)
+    avg_ankle = [(l_ankle[0] + r_ankle[0]) / 2, (l_ankle[1] + r_ankle[1]) / 2]
+    pixel_height = calculate_distance(nose, avg_ankle, image_width, image_height)
+
+    pixels_per_cm = pixel_height / height_cm
+
+    measurements = calculate_measurements(keypoints, image_np, image_width, image_height, pixels_per_cm)
+
+    return jsonify({
+        "scale": {
+            "pixels_per_cm": round(pixels_per_cm, 4),
+            "estimated_pixel_height": round(pixel_height, 2),
+            "assumed_real_height_cm": height_cm
+        },
+        "shirt_measurements_in_inches": measurements
+    })
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", debug=True)
+
+    ====================================================================================================================
+
+    hip width ::::
+
+
+    def calculate_distance(p1, p2, image_width, image_height):
+    x1, y1 = p1
+    x2, y2 = p2
+    return np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+
+
+@app.route('/measurement2', methods=['POST'])
+def measure_hip_widths():
+    if 'front_image' not in request.files or 'side_image' not in request.files:
+        return jsonify({"error": "Both front and side images are required"}), 400
+
+    try:
+        height_cm = float(request.form.get('height_cm', 170))
+    except ValueError:
+        return jsonify({"error": "Invalid height"}), 400
+
+    def extract_keypoints(image_file):
+        image = Image.open(image_file.stream).convert('RGB')
+        np_image = np.array(image)
+        h, w, _ = np_image.shape
+        keypoints = run_inference(np_image)  
+        return keypoints, h, w
+
+    def get_kp(kp, index):
+        return kp[index][:2]  
+
+    try:
+        # ---- FRONT IMAGE ----
+        kp_front, h1, w1 = extract_keypoints(request.files['front_image'])
+        left_ankle_front = get_kp(kp_front, 15)
+        right_ankle_front = get_kp(kp_front, 16)
+        nose_front = get_kp(kp_front, 0)
+        mid_ankle_front = [(left_ankle_front[0] + right_ankle_front[0]) / 2,
+                           (left_ankle_front[1] + right_ankle_front[1]) / 2]
+        pixel_height_front = calculate_distance(nose_front, mid_ankle_front, w1, h1)
+        pixels_per_cm_front = pixel_height_front / height_cm
+        front_ankle_distance_px = calculate_distance(left_ankle_front, right_ankle_front, w1, h1)
+        front_hip_width_cm = front_ankle_distance_px / pixels_per_cm_front
+
+        # ---- SIDE IMAGE ----
+        kp_side, h2, w2 = extract_keypoints(request.files['side_image'])
+        left_ankle_side = get_kp(kp_side, 15)
+        right_ankle_side = get_kp(kp_side, 16)
+        nose_side = get_kp(kp_side, 0)
+        mid_ankle_side = [(left_ankle_side[0] + right_ankle_side[0]) / 2,
+                          (left_ankle_side[1] + right_ankle_side[1]) / 2]
+        pixel_height_side = calculate_distance(nose_side, mid_ankle_side, w2, h2)
+        pixels_per_cm_side = pixel_height_side / height_cm
+        side_ankle_distance_px = calculate_distance(left_ankle_side, right_ankle_side, w2, h2)
+        side_hip_width_cm = side_ankle_distance_px / pixels_per_cm_side
+
+        result = {
+            "front_hip_width_cm": round(front_hip_width_cm, 2),
+            "side_hip_width_cm": round(side_hip_width_cm, 2)
+        }
+        print(result)
+        return jsonify(result)
+
+    except Exception as e:
+        print(str(e))
+        return jsonify({"error": str(e)}), 400
