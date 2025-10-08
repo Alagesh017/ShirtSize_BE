@@ -282,6 +282,17 @@ def measure_wrist_distances():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+@app.route('/upload_record', methods=['POST'])
+def upload_record():
+    try:
+        data = request.get_json()
+        
+        print(data)
+        return jsonify({"message": "Record uploaded successfully"}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", debug=True)

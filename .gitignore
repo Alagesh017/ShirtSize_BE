@@ -1,0 +1,47 @@
+# Virtual environment
+venv/
+
+# Migration
+migrations/
+
+# Compiled Python files
+*.pyc
+__pycache__/
+
+# IDE or Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Environment configuration
+instance/config.py
+
+# Generated files
+*.pyc
+.pytest_cache/
+
+# Log files
+*.log
+
+# Compiled assets
+/static/css/*.css
+/static/js/*.js
+
+# Database files
+*.db
+*.sqlite
+
+# Environment variables
+.env
+
+# macOS system files
+.DS_Store
+*.zip
+*.pdf
+src/assets/mail_addons/Glitz.docx
+/src/assets
+/src/assets
+/src/assets
+src/assets/mail_addons/Glitz.docx
+src/assets/mail_addons/glitz_meeting.docx
