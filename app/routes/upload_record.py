@@ -7,6 +7,7 @@ upload_bp = Blueprint("upload", __name__, url_prefix="/upload")
 def upload_record():
     try:
         data = request.get_json()
+        print(data)
         if not data:
             return jsonify({"error": "No JSON data provided"}), 400
 
@@ -48,6 +49,7 @@ def upload_record():
 
     except Exception as e:
         db.session.rollback()
+        print (str(e))
         return jsonify({"error": str(e)}), 500
     
 @upload_bp.route('/records', methods=['GET'])
